@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import analyzer, database, licenses
+from . import analyzer, database, diff, licenses
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 SAMPLE_PATH = STATIC_DIR / "examples" / "sample-manifest.json"
@@ -30,9 +30,9 @@ app = FastAPI(
     description=(
         "上传包含包名、版本、许可证与依赖边的 manifest，"
         "系统规范化节点后按许可证兼容矩阵计算传递约束，"
-        "标出每个冲突的最短依赖路径，支持按包筛选与 JSON 导出。"
+        "标出每个冲突的最短依赖路径，支持按包筛选、JSON 导出与两次审计对比。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -113,6 +113,22 @@ def delete_audit(audit_id: int) -> Dict[str, Any]:
     if not database.delete_audit(audit_id):
         raise HTTPException(status_code=404, detail="审计记录不存在：%s" % audit_id)
     return {"deleted": audit_id}
+
+
+@app.get("/api/diff", tags=["diff"], summary="对比两次审计（新增/消失/状态变化的冲突与告警）")
+def diff_audits(base_id: int, target_id: int) -> Dict[str, Any]:
+    """按 包名@版本 配对两次审计的节点，输出新增、消失及状态变化的
+    许可证冲突/告警，并附上双方各自的最短依赖路径。
+
+    对比只读取历史记录，不会生成或写入任何新审计。
+    """
+    base = database.get_audit(base_id)
+    if base is None:
+        raise HTTPException(status_code=404, detail="基准审计记录不存在：%s" % base_id)
+    target = database.get_audit(target_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="对比审计记录不存在：%s" % target_id)
+    return diff.diff_results(base, target, base_id=base_id, target_id=target_id)
 
 
 @app.get("/api/matrix", tags=["meta"], summary="许可证兼容矩阵")

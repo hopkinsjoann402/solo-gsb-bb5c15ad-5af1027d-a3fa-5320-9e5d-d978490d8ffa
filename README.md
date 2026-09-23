@@ -10,7 +10,10 @@ manifest，系统会：
 3. **标出最短冲突路径** —— 对每一对不兼容的“祖先许可证 → 后代许可证”，用 BFS 给出
    **最短依赖路径**（冲突路径上每个节点都标注许可证），硬冲突与“需人工确认”告警分级展示；
 4. **按包筛选** —— 包名子串过滤，凡最短路径经过该包的冲突都会保留；
-5. **导出 JSON** —— 完整审计结果（含筛选结果）可一键下载；审计记录持久化在 SQLite。
+5. **导出 JSON** —— 完整审计结果（含筛选结果）可一键下载；审计记录持久化在 SQLite；
+6. **两次审计对比** —— 从历史记录中选择两个 `audit_id`，按 **包名@版本** 配对节点，
+   展示两次审计之间新增、消失及状态变化（级别 / 许可证 / 原因 / 最短路径变化）的冲突与告警，
+   并同时给出双方各自的最短依赖路径。对比只读取历史记录，**不会写入新审计**。
 
 ## 快速开始（Docker Compose，推荐）
 
@@ -18,17 +21,21 @@ manifest，系统会：
 docker compose up --build
 ```
 
-容器启动时会自动初始化数据库（SQLite 文件位于卷 `audit-data`，容器内路径 `/data/audit.db`）。
+容器启动时会自动初始化数据库（SQLite 文件位于卷 `audit-data`，容器内路径 `/data/audit.db`），
+随后在宿主机 **8000 端口** 提供服务。
 
 启动后访问：
 
 | 地址 | 说明 |
 | --- | --- |
-| <http://localhost:8000/> | 网页界面（已自动载入示例 manifest） |
+| <http://localhost:8000/> | 网页界面（已自动载入示例 manifest，页内可做两次审计对比） |
 | <http://localhost:8000/docs> | Swagger 风格交互式 JSON API 文档 |
 | <http://localhost:8000/redoc> | ReDoc API 文档 |
 | <http://localhost:8000/api/matrix> | 许可证兼容矩阵（机器可读） |
 | <http://localhost:8000/healthz> | 健康检查 |
+
+端口在 `docker-compose.yml` 的 `ports: ["8000:8000"]` 映射，宿主机 8000 被占用时可改为
+`"18000:8000"` 再访问 <http://localhost:18000/>。
 
 停止并保留数据：`docker compose down`；连同数据卷一起清除：`docker compose down -v`。
 
@@ -93,6 +100,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/api/audits/{id}` | 获取审计结果；`?package=xxx` 按包筛选 |
 | GET | `/api/audits/{id}?download=true&package=xxx` | 导出（筛选后的）JSON 文件 |
 | DELETE | `/api/audits/{id}` | 删除审计记录 |
+| GET | `/api/diff?base_id=1&target_id=2` | 对比两次审计（新增/消失/状态变化，含双方最短路径） |
 | GET | `/api/matrix` | 许可证兼容矩阵 |
 | GET | `/api/sample` | 内置示例 manifest |
 
@@ -104,7 +112,65 @@ curl -F "file=@static/examples/sample-manifest.json" http://localhost:8000/api/a
 
 # 按包筛选并导出
 curl -OJ "http://localhost:8000/api/audits/1?package=pdf-export&download=true"
+
+# 对比审计 #1（基准/旧）与 #2（对比/新），仅读取历史，不会生成新审计
+curl "http://localhost:8000/api/diff?base_id=1&target_id=2"
 ```
+
+任一 `audit_id` 不存在时返回 `404` 并指明缺失的是哪一条，例如：
+
+```json
+{ "detail": "对比审计记录不存在：9" }
+```
+
+### 对比结果结构（节选）
+
+- `base` / `target`：两侧审计的 `audit_id`、名称、状态与汇总；
+- `summary`：新增 / 消失 / 状态变化的冲突、节点、告警计数；
+- `conflicts.added` / `removed` / `changed`：每条冲突附带 `base` 与 `target`
+  两侧快照，`severity`（error=硬冲突 / warning=需人工确认）、`distance` 与
+  `path`（该侧 BFS 算出的最短依赖路径）；`added` 仅有 `target`，`removed` 仅有
+  `base`，`changed` 两侧都有并给出 `changes`（`status` / `license` / `reason` / `path`）；
+- `nodes.added` / `removed` / `license_changed`：按 **包名@版本** 配对的节点变化；
+- `warnings.added` / `removed`：解析告警（含未解析依赖）的文本级差异。
+
+```json
+{
+  "base":   { "audit_id": 1, "manifest_name": "billing-platform-demo", "status": "conflict" },
+  "target": { "audit_id": 2, "manifest_name": "billing-platform-demo", "status": "conflict" },
+  "summary": {
+    "conflicts_added": 1, "conflicts_removed": 2, "conflicts_changed": 1,
+    "nodes_added": 1, "nodes_removed": 1, "nodes_license_changed": 1,
+    "warnings_added": 0, "warnings_removed": 0
+  },
+  "conflicts": {
+    "added": [
+      { "ancestor": "new-g@1.0.0", "node": "apache-lib@1.0.0",
+        "base": null,
+        "target": { "severity": "error", "distance": 1,
+                    "path": ["new-g@1.0.0", "apache-lib@1.0.0"], "reason": "…" } }
+    ],
+    "removed": [ /* 同构，仅有 base */ ],
+    "changed": [
+      { "ancestor": "web-app@2.1.0", "node": "duo@1.0.0",
+        "changes": ["status", "license"],
+        "base":   { "severity": "warning", "distance": 1, "path": ["…", "…"] },
+        "target": { "severity": "error",   "distance": 1, "path": ["…", "…"] } }
+    ]
+  },
+  "nodes": {
+    "added":   [ { "id": "new-g@1.0.0", "license_display": "GPL-2.0" } ],
+    "removed": [ { "id": "gone@1.0.0", "license_display": "GPL-2.0" } ],
+    "license_changed": [
+      { "id": "duo@1.0.0", "base_license": "OFL-1.1", "target_license": "GPL-2.0" }
+    ]
+  },
+  "warnings": { "added": [], "removed": [] }
+}
+```
+
+网页上对应入口为页面底部的 **「两次审计对比」** 卡片：两个下拉分别选择基准与对比记录
+（默认基准=次新、对比=最新），点击「开始对比」即可看到上述分组结果与双方最短路径。
 
 ## 审计结果结构（节选）
 
@@ -159,14 +225,25 @@ curl -OJ "http://localhost:8000/api/audits/1?package=pdf-export&download=true"
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由（JSON API + 网页）
+│   ├── main.py        # FastAPI 路由（JSON API + 网页），含 GET /api/diff
 │   ├── analyzer.py    # manifest 解析、节点规范化、传递约束、最短路径
+│   ├── diff.py        # 两次审计对比：节点/冲突/告警的新增、消失、状态变化
 │   ├── licenses.py    # 许可证别名规范化与兼容矩阵
-│   └── database.py    # SQLite 初始化与审计记录持久化
+│   └── database.py    # SQLite 初始化与审计记录持久化（对比只读、不写入）
 ├── static/
-│   ├── index.html     # 单文件网页（无外部 CDN 依赖）
+│   ├── index.html     # 单文件网页（无外部 CDN 依赖，含审计对比卡片）
 │   └── examples/sample-manifest.json
+├── tests/
+│   ├── test_analyzer.py
+│   └── test_diff.py
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
+```
+
+轻量自测（无测试框架依赖）：
+
+```bash
+python3 -m tests.test_analyzer   # 规范化 / 兼容矩阵 / 最短路径
+python3 -m tests.test_diff       # 两次审计对比
 ```

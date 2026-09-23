@@ -46,6 +46,10 @@
     border: 1px solid var(--line); border-radius: 7px; padding: 8px 12px; font-size: 13px;
     min-width: 240px;
   }
+  select {
+    border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px;
+    font-size: 13px; max-width: 340px; background: #fff;
+  }
   .hint { color: var(--muted); font-size: 12px; }
   .alert { border-radius: 8px; padding: 10px 14px; margin-bottom: 14px; font-size: 13px; display: none; }
   .alert.show { display: block; }
@@ -85,6 +89,10 @@
   summary { cursor: pointer; color: var(--brand); font-size: 13px; }
   .hidden-block { display: none; }
   .pill { font-size: 11px; padding: 1px 7px; border-radius: 999px; background: #eef2f8; color: var(--muted); }
+  .badge.added   { background: var(--err-bg); color: var(--err); }
+  .badge.removed { background: var(--ok-bg); color: var(--ok); }
+  .badge.changed { background: var(--warn-bg); color: var(--warn); }
+  .path-label { font-size: 12px; color: var(--muted); margin: 8px 0 4px; }
   mark { background: #fff1a8; border-radius: 3px; padding: 0 2px; }
 </style>
 </head>
@@ -153,6 +161,34 @@
     <div class="card">
       <h2>5. 告警与未解析依赖</h2>
       <div id="warnings"></div>
+    </div>
+  </section>
+
+  <section class="card" id="compare">
+    <h2>两次审计对比</h2>
+    <div class="row" style="margin-top:0;">
+      <label class="hint">基准（旧）<br><select id="cmp-base"></select></label>
+      <label class="hint">对比（新）<br><select id="cmp-target"></select></label>
+      <button id="btn-compare">开始对比</button>
+      <button class="secondary" id="btn-refresh-history">刷新历史</button>
+    </div>
+    <div class="hint" style="margin-top:8px;">
+      按 <span class="mono">包名@版本</span> 配对节点，展示新增 / 消失 / 状态变化的许可证冲突与告警，
+      并给出双方各自的最短依赖路径。对比只读取历史记录，不会生成新审计。
+    </div>
+    <div id="cmp-alert" class="alert" style="margin-top:12px;"></div>
+    <div id="cmp-result" class="hidden-block" style="margin-top:16px;">
+      <div class="stats">
+        <div class="stat"><div class="num" id="d-added" style="color:var(--err)">0</div><div class="label">新增冲突/告警</div></div>
+        <div class="stat"><div class="num" id="d-removed" style="color:var(--ok)">0</div><div class="label">消失冲突/告警</div></div>
+        <div class="stat"><div class="num" id="d-changed" style="color:var(--warn)">0</div><div class="label">状态变化</div></div>
+        <div class="stat"><div class="num" id="d-nodes-add">0</div><div class="label">新增节点</div></div>
+        <div class="stat"><div class="num" id="d-nodes-del">0</div><div class="label">消失节点</div></div>
+        <div class="stat"><div class="num" id="d-lic-chg">0</div><div class="label">许可证变更</div></div>
+      </div>
+      <div id="d-groups" style="margin-top:18px;"></div>
+      <div id="d-nodes" style="margin-top:18px;"></div>
+      <div id="d-warnings" style="margin-top:18px;"></div>
     </div>
   </section>
 </main>
@@ -302,7 +338,10 @@ $("btn-audit").addEventListener("click", async () => {
   $("btn-audit").disabled = true;
   const result = await doAudit(manifest, manifest.name);
   $("btn-audit").disabled = false;
-  if (result) { currentFilter = ""; $("filter").value = ""; render(result); }
+  if (result) {
+    currentFilter = ""; $("filter").value = ""; render(result);
+    loadHistory(true);  // 新审计进入历史下拉，便于立即对比
+  }
 });
 
 $("file").addEventListener("change", () => {
@@ -334,8 +373,172 @@ $("btn-export").addEventListener("click", () => {
   window.location.href = url;
 });
 
+// --- 两次审计对比 -----------------------------------------------------------
+
+const CHANGE_LABELS = {
+  status: "判定/级别变化",
+  license: "许可证变化",
+  reason: "原因变化",
+  path: "最短路径变化",
+};
+
+function showCmpAlert(msg) {
+  const el = $("cmp-alert");
+  el.textContent = msg;
+  el.className = "alert error show";
+}
+function clearCmpAlert() { $("cmp-alert").className = "alert"; }
+
+async function loadHistory(keepSelection) {
+  const prevBase = $("cmp-base").value;
+  const prevTarget = $("cmp-target").value;
+  let items = [];
+  try {
+    const resp = await fetch("/api/audits?limit=100");
+    items = (await resp.json()).items || [];
+  } catch (e) { return; }
+  const has = (id) => items.some((it) => String(it.id) === id);
+  const opts = items.map((it) =>
+    `<option value="${it.id}">#${it.id} · ${esc(it.name)} · ${esc(it.status)} · ${esc(it.created_at)}</option>`
+  ).join("");
+  $("cmp-base").innerHTML = opts;
+  $("cmp-target").innerHTML = opts;
+  // 默认：基准选次新的一条，对比选最新的一条
+  $("cmp-base").value = (keepSelection && has(prevBase)) ? prevBase
+    : (items.length > 1 ? String(items[1].id) : (items[0] ? String(items[0].id) : ""));
+  $("cmp-target").value = (keepSelection && has(prevTarget)) ? prevTarget
+    : (items[0] ? String(items[0].id) : "");
+  $("btn-compare").disabled = items.length === 0;
+}
+
+function sideLabel(meta) {
+  return "#" + meta.audit_id + " " + (meta.manifest_name || "");
+}
+
+function diffPathBlock(label, side) {
+  if (!side) return "";
+  return `<div class="path-label">${esc(label)} · 最短路径 ${side.distance} 跳 · ` +
+    `${esc(side.ancestor_license)} → ${esc(side.node_license)}</div>` +
+    `<div class="path">${side.path.map(esc).join('<span class="arrow">→</span>')}</div>`;
+}
+
+function diffCard(entry, kind) {
+  const side = entry.target || entry.base;
+  const sevBadge = side.severity === "error"
+    ? '<span class="badge conflict">硬冲突</span>'
+    : '<span class="badge warning">需人工确认</span>';
+  const kindBadge = {
+    added: '<span class="badge added">新增</span>',
+    removed: '<span class="badge removed">消失</span>',
+    changed: '<span class="badge changed">状态变化</span>',
+  }[kind];
+  const changeBadges = (entry.changes || []).map((c) =>
+    `<span class="pill">${CHANGE_LABELS[c] || esc(c)}</span>`).join(" ");
+  let reasonHtml;
+  if (entry.base && entry.target && entry.base.reason !== entry.target.reason) {
+    reasonHtml = `<div class="reason">基准：${esc(entry.base.reason)}<br>对比：${esc(entry.target.reason)}</div>`;
+  } else {
+    reasonHtml = `<div class="reason">${esc(side.reason)}</div>`;
+  }
+  const baseBlock = entry.base ? diffPathBlock("基准 " + sideLabel(currentDiff.base), entry.base) : "";
+  const targetBlock = entry.target ? diffPathBlock("对比 " + sideLabel(currentDiff.target), entry.target) : "";
+  return `<div class="conflict ${side.severity === "error" ? "error" : "warning"}">
+    <div class="head">${kindBadge} ${sevBadge} ${changeBadges}
+      <span class="mono"><b>${esc(entry.ancestor)}</b> ──→ <b>${esc(entry.node)}</b></span>
+    </div>
+    ${reasonHtml}
+    ${kind === "removed" ? baseBlock : (kind === "added" ? targetBlock : baseBlock + targetBlock)}
+  </div>`;
+}
+
+function diffGroup(title, badgeClass, items, kind) {
+  if (!items.length) return "";
+  return `<h3 style="font-size:14px;margin:0 0 10px;">${title} <span class="badge ${badgeClass}">${items.length}</span></h3>` +
+    items.map((e) => diffCard(e, kind)).join("");
+}
+
+let currentDiff = null;
+
+function renderDiff(data) {
+  currentDiff = data;
+  $("cmp-result").className = "";
+  const s = data.summary;
+  $("d-added").textContent = s.conflicts_added;
+  $("d-removed").textContent = s.conflicts_removed;
+  $("d-changed").textContent = s.conflicts_changed;
+  $("d-nodes-add").textContent = s.nodes_added;
+  $("d-nodes-del").textContent = s.nodes_removed;
+  $("d-lic-chg").textContent = s.nodes_license_changed;
+
+  const groups =
+    diffGroup("新增的冲突 / 告警", "added", data.conflicts.added, "added") +
+    diffGroup("消失的冲突 / 告警", "removed", data.conflicts.removed, "removed") +
+    diffGroup("状态变化的冲突 / 告警", "changed", data.conflicts.changed, "changed");
+  $("d-groups").innerHTML = groups ||
+    '<p class="muted">两次审计的许可证冲突与告警完全一致。</p>';
+
+  const n = data.nodes;
+  const nodeParts = [];
+  if (n.added.length) {
+    nodeParts.push("<div><b>新增节点</b>：" + n.added.map((x) =>
+      `<span class="mono">${esc(x.id)}</span> <span class="badge ${catClass(x.license_category)}">${esc(x.license_display)}</span>`
+    ).join("、") + "</div>");
+  }
+  if (n.removed.length) {
+    nodeParts.push("<div><b>消失节点</b>：" + n.removed.map((x) =>
+      `<span class="mono">${esc(x.id)}</span> <span class="badge ${catClass(x.license_category)}">${esc(x.license_display)}</span>`
+    ).join("、") + "</div>");
+  }
+  if (n.license_changed.length) {
+    nodeParts.push("<div><b>许可证变更</b>：" + n.license_changed.map((x) =>
+      `<span class="mono">${esc(x.id)}</span>：${esc(x.base_license)} → <b>${esc(x.target_license)}</b>`
+    ).join("；") + "</div>");
+  }
+  $("d-nodes").innerHTML = nodeParts.length
+    ? '<h3 style="font-size:14px;margin:0 0 8px;">节点变化（按 包名@版本 配对）</h3>' + nodeParts.join("")
+    : "";
+
+  const w = data.warnings;
+  const warnParts = [];
+  if (w.added.length) {
+    warnParts.push("<div><b>新增告警</b><ul style='margin:4px 0;padding-left:20px;'>" +
+      w.added.map((x) => "<li>" + esc(x) + "</li>").join("") + "</ul></div>");
+  }
+  if (w.removed.length) {
+    warnParts.push("<div><b>消失告警</b><ul style='margin:4px 0;padding-left:20px;'>" +
+      w.removed.map((x) => "<li>" + esc(x) + "</li>").join("") + "</ul></div>");
+  }
+  $("d-warnings").innerHTML = warnParts.length
+    ? '<h3 style="font-size:14px;margin:0 0 8px;">解析告警变化</h3>' + warnParts.join("")
+    : "";
+}
+
+async function runCompare() {
+  clearCmpAlert();
+  const baseId = $("cmp-base").value;
+  const targetId = $("cmp-target").value;
+  if (!baseId || !targetId) { showCmpAlert("请先在历史记录中选择两次审计。"); return; }
+  $("btn-compare").disabled = true;
+  try {
+    const resp = await fetch("/api/diff?base_id=" + encodeURIComponent(baseId) +
+      "&target_id=" + encodeURIComponent(targetId));
+    const data = await resp.json();
+    if (!resp.ok) {
+      showCmpAlert(typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail));
+      return;
+    }
+    renderDiff(data);
+  } finally {
+    $("btn-compare").disabled = false;
+  }
+}
+
+$("btn-compare").addEventListener("click", runCompare);
+$("btn-refresh-history").addEventListener("click", () => loadHistory(true));
+
 // 自动载入示例，便于首次访问
 $("btn-sample").click();
+loadHistory(false);
 </script>
 </body>
 </html>

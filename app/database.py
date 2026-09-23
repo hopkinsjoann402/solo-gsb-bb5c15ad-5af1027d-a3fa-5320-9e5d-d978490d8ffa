@@ -160,6 +160,14 @@ def get_audit(manifest_id: int) -> Optional[Dict[str, Any]]:
     return json.loads(row["result_json"])
 
 
+def audit_exists(manifest_id: int) -> bool:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM manifests WHERE id = ?", (manifest_id,)
+        ).fetchone()
+    return row is not None
+
+
 def delete_audit(manifest_id: int) -> bool:
     with connect() as conn:
         cur = conn.execute("DELETE FROM manifests WHERE id = ?", (manifest_id,))

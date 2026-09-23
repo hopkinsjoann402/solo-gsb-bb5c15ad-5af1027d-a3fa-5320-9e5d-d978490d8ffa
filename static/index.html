@@ -86,6 +86,26 @@
   .hidden-block { display: none; }
   .pill { font-size: 11px; padding: 1px 7px; border-radius: 999px; background: #eef2f8; color: var(--muted); }
   mark { background: #fff1a8; border-radius: 3px; padding: 0 2px; }
+  select {
+    border: 1px solid var(--line); border-radius: 7px; padding: 8px 12px; font-size: 13px;
+    background: #fff; color: var(--ink); min-width: 300px; max-width: 100%;
+  }
+  select optgroup { font-weight: 600; }
+  .diff-add { color: var(--ok); font-weight: 700; }
+  .diff-remove { color: var(--err); font-weight: 700; }
+  .diff-change { color: var(--warn); font-weight: 700; }
+  .diff-arrow { color: var(--muted); padding: 0 6px; font-weight: 400; }
+  .path.base b { color: var(--err); }
+  .path.target b { color: var(--ok); }
+  .path-label { font-size: 11px; color: var(--muted); margin: 6px 0 2px; }
+  .path-label .tag {
+    font-size: 10px; padding: 0 6px; border-radius: 4px; margin-right: 6px; font-weight: 700;
+  }
+  .tag.base { background: var(--err-bg); color: var(--err); }
+  .tag.target { background: var(--ok-bg); color: var(--ok); }
+  .fields-changed { font-size: 12px; color: var(--muted); margin: 4px 0; }
+  .meta-line { color: var(--muted); font-size: 13px; margin-bottom: 12px; }
+  .node-lic-base, .node-lic-target { display: inline-block; }
 </style>
 </head>
 <body>
@@ -112,10 +132,27 @@
     </div>
   </section>
 
+  <section class="card">
+    <h2>2. 历史审计 · 两次对比</h2>
+    <div id="compare-alert" class="alert"></div>
+    <div class="row">
+      <select id="cmp-base"></select>
+      <span class="diff-arrow">⇄</span>
+      <select id="cmp-target"></select>
+      <button id="btn-compare">对比选中的两次审计</button>
+      <button class="secondary" id="btn-refresh-audits">刷新列表</button>
+    </div>
+    <div class="hint" style="margin-top:8px;">
+      对比为只读操作，不会创建新审计。节点按 <b>包名@版本</b> 配对，
+      许可证冲突/告警按「祖先节点 → 被依赖节点」配对，新增/消失/状态变化都会附上双方的最短依赖路径。
+    </div>
+    <div id="compare-result" class="hidden-block" style="margin-top:18px;"></div>
+  </section>
+
   <section id="result" class="hidden-block">
     <div class="card">
       <div class="row" style="justify-content:space-between;">
-        <h2 style="margin:0;">2. 审计结果 <span id="r-name" class="muted" style="font-weight:400;font-size:13px;"></span></h2>
+        <h2 style="margin:0;">3. 审计结果 <span id="r-name" class="muted" style="font-weight:400;font-size:13px;"></span></h2>
         <span id="r-status"></span>
       </div>
       <div class="stats" style="margin-top:14px;">
@@ -136,12 +173,12 @@
     </div>
 
     <div class="card">
-      <h2>3. 冲突与最短依赖路径</h2>
+      <h2>4. 冲突与最短依赖路径</h2>
       <div id="conflicts"></div>
     </div>
 
     <div class="card">
-      <h2>4. 节点与传递约束</h2>
+      <h2>5. 节点与传递约束</h2>
       <div style="overflow-x:auto;">
       <table id="nodes-table">
         <thead><tr><th>节点</th><th>版本</th><th>许可证</th><th>约束来源（传递）</th><th>硬冲突</th></tr></thead>
@@ -151,7 +188,7 @@
     </div>
 
     <div class="card">
-      <h2>5. 告警与未解析依赖</h2>
+      <h2>6. 告警与未解析依赖</h2>
       <div id="warnings"></div>
     </div>
   </section>
@@ -302,7 +339,7 @@ $("btn-audit").addEventListener("click", async () => {
   $("btn-audit").disabled = true;
   const result = await doAudit(manifest, manifest.name);
   $("btn-audit").disabled = false;
-  if (result) { currentFilter = ""; $("filter").value = ""; render(result); }
+  if (result) { currentFilter = ""; $("filter").value = ""; render(result); loadAuditList(); }
 });
 
 $("file").addEventListener("change", () => {
@@ -334,8 +371,190 @@ $("btn-export").addEventListener("click", () => {
   window.location.href = url;
 });
 
+// --- 两次审计对比 -----------------------------------------------------------
+
+function showCompareAlert(msg) {
+  const el = $("compare-alert");
+  el.textContent = msg;
+  el.className = "alert error show";
+}
+function clearCompareAlert() { $("compare-alert").className = "alert"; }
+
+const STATUS_LABEL = { conflict: "硬冲突", warning: "告警", clean: "无冲突" };
+
+async function loadAuditList() {
+  clearCompareAlert();
+  let items = [];
+  try {
+    const resp = await fetch("/api/audits?limit=100");
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || "加载历史审计失败");
+    items = data.items || [];
+  } catch (e) {
+    showCompareAlert(e.message);
+    return [];
+  }
+  const prev = { base: $("cmp-base").value, target: $("cmp-target").value };
+  const fill = (sel, selected) => {
+    sel.innerHTML = "";
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = items.length ? "请选择审计记录…" : "（暂无历史审计，请先在上方执行一次审计）";
+    sel.appendChild(placeholder);
+    items.forEach((a) => {
+      const opt = document.createElement("option");
+      opt.value = String(a.id);
+      opt.textContent = "#" + a.id + " · " + a.name + " · " + STATUS_LABEL[a.status] + (a.conflict_count ? "（" + a.conflict_count + " 硬冲突）" : "") + " · " + (a.created_at || "");
+      sel.appendChild(opt);
+    });
+    if (selected && items.some((a) => String(a.id) === selected)) sel.value = selected;
+  };
+  fill($("cmp-base"), prev.base);
+  fill($("cmp-target"), prev.target || (items.length > 1 ? String(items[1].id) : ""));
+  // 首次加载默认选最新两条（列表为倒序：items[0] 最新）
+  if (!prev.base && items.length) $("cmp-base").value = String(items[0].id);
+  return items;
+}
+
+function severityBadge(sev) {
+  if (sev === "error") return '<span class="badge conflict">硬冲突</span>';
+  if (sev === "warning") return '<span class="badge warning">需人工确认</span>';
+  return '<span class="muted">—</span>';
+}
+
+function renderComparePath(path, side, nodeMap) {
+  return '<div class="path-label"><span class="tag ' + side + '">' +
+    (side === "base" ? "基准" : "目标") + "</span>最短依赖路径（" + (path.length - 1) + " 跳）</div>" +
+    '<div class="path ' + side + '">' + path.map((nid) => {
+      const node = nodeMap[nid];
+      const lic = node ? node.license_display : "";
+      return esc(nid) + (lic ? ' <span class="muted">[' + esc(lic) + ']</span>' : "");
+    }).join('<span class="arrow">→</span>') + "</div>";
+}
+
+function findingTitle(f) {
+  const present = f.target || f.base;
+  return '<span class="mono"><b>' + esc(f.ancestor) + "</b> ── <span class='muted'>许可证</span> ── <b>" +
+    esc(f.node) + "</b></span>";
+}
+
+function renderFindingsBox(title, list) {
+  if (!list.length) return "";
+  const rows = list.map((f) => {
+    const present = f.target || f.base;
+    const paths = [];
+    if (f.base) paths.push(renderComparePath(f.base.path, "base", window.__cmpNodeMaps.base));
+    if (f.target) paths.push(renderComparePath(f.target.path, "target", window.__cmpNodeMaps.target));
+    const head = f.change === "changed"
+      ? severityBadge(f.severity_base) + '<span class="diff-arrow">→</span>' + severityBadge(f.severity_target)
+      : severityBadge(present.severity);
+    let fields = "";
+    if (f.fields_changed && f.fields_changed.length) {
+      const labels = f.fields_changed.map((k) => window.__cmpLabels[k] || k).join("、");
+      fields = '<div class="fields-changed">变化项：' + esc(labels) + "</div>";
+    }
+    const reason = present.reason ? '<div class="reason">' + esc(present.reason) + "</div>" : "";
+    return '<div class="conflict ' + (present.severity === "error" ? "error" : "warning") + '">' +
+      '<div class="head">' + head + findingTitle(f) + "</div>" +
+      fields + reason + paths.join("") + "</div>";
+  }).join("");
+  return "<h3 style='margin:16px 0 8px;font-size:14px;'>" + esc(title) +
+    ' <span class="pill">' + list.length + " 条</span></h3>" + rows;
+}
+
+function renderLicensePair(b, t) {
+  const lb = b ? esc(b.license_display) : "—";
+  const lt = t ? esc(t.license_display) : "—";
+  if (b && t && b.license !== t.license) {
+    return '<span class="diff-remove">' + lb + "</span><span class='diff-arrow'>→</span><span class='diff-add'>" + lt + "</span>";
+  }
+  return lb === "—" && lt === "—" ? "—" : (t ? lt : lb);
+}
+
+function renderCompare(data) {
+  window.__cmpNodeMaps = {
+    base: {},
+    target: {},
+  };
+  // 节点完整许可证信息在各审计结果中拿不到，对比 API 的 node brief 已含 license_display，
+  // 路径展示所需的节点许可证直接用 nodes 配对表补。
+  data.nodes.forEach((n) => {
+    if (n.base) window.__cmpNodeMaps.base[n.id] = n.base;
+    if (n.target) window.__cmpNodeMaps.target[n.id] = n.target;
+  });
+  window.__cmpLabels = data.field_labels || {};
+
+  const meta = (m) => m ? ("#" + m.audit_id + " · " + (m.manifest_name || "") + " · " + (m.created_at || "")) : "";
+  const s = data.summary;
+  let html = '<div class="meta-line">基准 <span class="mono">' + esc(meta(data.base)) + "</span>" +
+    '<span class="diff-arrow">→</span>目标 <span class="mono">' + esc(meta(data.target)) + "</span></div>";
+
+  html += '<div class="stats">' +
+    '<div class="stat"><div class="num diff-add">+' + s.findings.added + "</div><div class='label'>新增冲突/告警（硬冲突 " + s.findings.added_errors + "）</div></div>" +
+    '<div class="stat"><div class="num diff-remove">−' + s.findings.removed + "</div><div class='label'>消失冲突/告警（硬冲突 " + s.findings.removed_errors + "）</div></div>" +
+    '<div class="stat"><div class="num diff-change">≈' + s.findings.changed + "</div><div class='label'>状态变化（硬冲突 " + s.findings.changed_errors + "）</div></div>" +
+    '<div class="stat"><div class="num diff-add">+' + s.nodes.added + " / <span class='diff-remove'>−" + s.nodes.removed + "</span></div><div class='label'>新增/消失节点</div></div>" +
+    '<div class="stat"><div class="num">' + s.nodes.license_changed + "</div><div class='label'>同节点许可证变化</div></div>" +
+    "</div>";
+
+  html += renderFindingsBox("🆕 新增的冲突/告警（仅目标审计存在）", data.added) +
+    renderFindingsBox("❌ 消失的冲突/告警（仅基准审计存在）", data.removed) +
+    renderFindingsBox("🔁 配对项变化（状态 / 许可证 / 最短路径）", data.changed);
+  if (!data.added.length && !data.removed.length && !data.changed.length) {
+    html += '<p class="muted" style="margin-top:12px;">两次审计的许可证冲突/告警完全一致。</p>';
+  }
+
+  html += '<details style="margin-top:16px;"><summary>查看节点配对明细（' + data.nodes.length + " 个）</summary>" +
+    '<div style="overflow-x:auto;margin-top:8px;"><table><thead><tr>' +
+    "<th>包名</th><th>版本</th><th>变化</th><th>许可证（基准 → 目标）</th><th>硬冲突数（基准 → 目标）</th>" +
+    "</tr></thead><tbody>";
+  const CHANGE_UI = {
+    added: '<span class="badge clean">新增节点</span>',
+    removed: '<span class="badge conflict">消失节点</span>',
+    unchanged: '<span class="pill">配对成功</span>',
+  };
+  data.nodes.forEach((n) => {
+    const version = n.version_unspecified ? '<span class="muted">未指定</span>' : esc(n.version);
+    let change = CHANGE_UI[n.change] || CHANGE_UI.unchanged;
+    if (n.change === "unchanged" && n.license_changed) change += ' <span class="badge warning">许可证变化</span>';
+    const cb = n.base ? n.base.conflict_count : null;
+    const ct = n.target ? n.target.conflict_count : null;
+    const counts = (cb === null ? "—" : cb) + '<span class="diff-arrow">→</span>' + (ct === null ? "—" : ct);
+    html += "<tr><td class='mono'>" + esc(n.name) + "</td><td class='mono'>" + version +
+      "</td><td>" + change + "</td><td>" + renderLicensePair(n.base, n.target) +
+      "</td><td class='mono'>" + counts + "</td></tr>";
+  });
+  html += "</tbody></table></div></details>";
+
+  $("compare-result").innerHTML = html;
+  $("compare-result").className = "";
+}
+
+$("btn-compare").addEventListener("click", async () => {
+  clearCompareAlert();
+  const baseId = $("cmp-base").value;
+  const targetId = $("cmp-target").value;
+  if (!baseId || !targetId) { showCompareAlert("请先选择两条审计记录。"); return; }
+  if (baseId === targetId) { showCompareAlert("请选择两条不同的审计记录。"); return; }
+  $("btn-compare").disabled = true;
+  try {
+    const resp = await fetch("/api/audits/compare/" + baseId + "/" + targetId);
+    const data = await resp.json();
+    if (!resp.ok) { showCompareAlert(typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail)); return; }
+    renderCompare(data);
+  } catch (e) {
+    showCompareAlert("对比请求失败：" + e.message);
+  } finally {
+    $("btn-compare").disabled = false;
+  }
+});
+
+$("btn-refresh-audits").addEventListener("click", loadAuditList);
+
 // 自动载入示例，便于首次访问
 $("btn-sample").click();
+// 页面加载即拉取历史审计，便于立即选择对比
+loadAuditList();
 </script>
 </body>
 </html>

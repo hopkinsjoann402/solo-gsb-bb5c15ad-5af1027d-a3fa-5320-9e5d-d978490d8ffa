@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import analyzer, database, licenses
+from . import analyzer, compare as compare_mod, database, licenses
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 SAMPLE_PATH = STATIC_DIR / "examples" / "sample-manifest.json"
@@ -84,6 +84,29 @@ async def upload_manifest(
 def list_audits(limit: int = 20) -> Dict[str, Any]:
     limit = max(1, min(limit, 100))
     return {"items": database.list_audits(limit)}
+
+
+@app.get(
+    "/api/audits/compare/{base_id}/{target_id}",
+    tags=["audit"],
+    summary="对比两次审计（按包名+版本配对节点与冲突，纯只读）",
+)
+def compare_audits(base_id: int, target_id: int) -> Dict[str, Any]:
+    if base_id == target_id:
+        raise HTTPException(status_code=400, detail="请选择两条不同的审计记录进行对比：%d 与 %d 相同。" % (base_id, target_id))
+    missing = [
+        aid for aid in (base_id, target_id)
+        if not database.audit_exists(aid)
+    ]
+    if missing:
+        raise HTTPException(
+            status_code=404,
+            detail="审计记录不存在：%s。对比为只读操作，不会创建新审计。"
+            % "、".join("#%d" % aid for aid in missing),
+        )
+    base_result = database.get_audit(base_id)
+    target_result = database.get_audit(target_id)
+    return compare_mod.compare_audits(base_result, target_result)
 
 
 @app.get("/api/audits/{audit_id}", tags=["audit"], summary="获取某次审计结果（支持按包筛选/导出）")

@@ -10,27 +10,34 @@ manifest，系统会：
 3. **标出最短冲突路径** —— 对每一对不兼容的“祖先许可证 → 后代许可证”，用 BFS 给出
    **最短依赖路径**（冲突路径上每个节点都标注许可证），硬冲突与“需人工确认”告警分级展示；
 4. **按包筛选** —— 包名子串过滤，凡最短路径经过该包的冲突都会保留；
-5. **导出 JSON** —— 完整审计结果（含筛选结果）可一键下载；审计记录持久化在 SQLite。
+5. **导出 JSON** —— 完整审计结果（含筛选结果）可一键下载；审计记录持久化在 SQLite；
+6. **两次审计对比** —— 从历史中选择两个 `audit_id`，按 **包名+版本** 配对节点、
+   按「祖先节点 → 被依赖节点」配对冲突/告警，展示新增、消失及状态变化（严重程度/
+   许可证/最短路径），每条都附上双方各自的最短依赖路径；对比为纯只读操作，
+   记录不存在时返回明确错误（404），**不会写入新审计**。
 
-## 快速开始（Docker Compose，推荐）
+## 快速开始（Docker Compose，一键启动，推荐）
 
 ```bash
-docker compose up --build
+docker compose up --build          # 前台启动（加 -d 可后台运行）
 ```
 
+服务监听容器内 **8000** 端口，Compose 已映射到宿主机 **8000**：<http://localhost:8000/>。
 容器启动时会自动初始化数据库（SQLite 文件位于卷 `audit-data`，容器内路径 `/data/audit.db`）。
 
 启动后访问：
 
 | 地址 | 说明 |
 | --- | --- |
-| <http://localhost:8000/> | 网页界面（已自动载入示例 manifest） |
+| <http://localhost:8000/> | 网页界面（已自动载入示例 manifest；第 2 节可选择两次历史审计进行对比） |
 | <http://localhost:8000/docs> | Swagger 风格交互式 JSON API 文档 |
 | <http://localhost:8000/redoc> | ReDoc API 文档 |
 | <http://localhost:8000/api/matrix> | 许可证兼容矩阵（机器可读） |
 | <http://localhost:8000/healthz> | 健康检查 |
 
 停止并保留数据：`docker compose down`；连同数据卷一起清除：`docker compose down -v`。
+8000 端口被占用时，可修改 `docker-compose.yml` 中 `"8000:8000"` 的宿主机一侧
+（例如 `"18000:8000"`），随后访问 <http://localhost:18000/>。
 
 ## 本地直接运行
 
@@ -92,6 +99,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/api/audits?limit=20` | 历史审计列表 |
 | GET | `/api/audits/{id}` | 获取审计结果；`?package=xxx` 按包筛选 |
 | GET | `/api/audits/{id}?download=true&package=xxx` | 导出（筛选后的）JSON 文件 |
+| GET | `/api/audits/compare/{base_id}/{target_id}` | **两次审计对比**（只读，不写入） |
 | DELETE | `/api/audits/{id}` | 删除审计记录 |
 | GET | `/api/matrix` | 许可证兼容矩阵 |
 | GET | `/api/sample` | 内置示例 manifest |
@@ -105,6 +113,41 @@ curl -F "file=@static/examples/sample-manifest.json" http://localhost:8000/api/a
 # 按包筛选并导出
 curl -OJ "http://localhost:8000/api/audits/1?package=pdf-export&download=true"
 ```
+
+### 两次审计对比接口
+
+```bash
+curl http://localhost:8000/api/audits/compare/1/2
+```
+
+路径方向为 **基准 → 目标**：`added` 表示仅目标审计（#2）存在，`removed` 表示仅基准审计（#1）存在。
+返回内容：
+
+- `summary.nodes` —— 节点（按 `name@version` 配对）的新增 / 消失 / 配对成功 / 同节点许可证变化数量；
+- `summary.findings` —— 冲突/告警的新增、消失、变化数量（并分别统计其中硬冲突数）；
+- `added` / `removed` —— 每条携带存在侧的完整冲突对象，含 `path` 最短依赖路径；
+  缺失侧固定为 `null`；
+- `changed` —— 双方都存在的配对项，同时给出 `base.path` 与 `target.path`，
+  `fields_changed` 标明变化项：`severity`（硬冲突⇄告警）、`status`（兼容判定）、
+  `ancestor_license` / `node_license`（许可证原文或规范标识变化）、`path`（最短路径变化）；
+- `nodes` —— 节点配对明细，含双方许可证、硬冲突数及变化方向。
+
+对比是**只读**操作，不会创建任何审计记录；任一 `audit_id` 不存在时返回 `404`
+并指出缺失的编号，传入相同编号返回 `400`：
+
+```bash
+$ curl -i http://localhost:8000/api/audits/compare/1/999
+HTTP/1.1 404 Not Found
+{"detail":"审计记录不存在：#999。对比为只读操作，不会创建新审计。"}
+
+$ curl -i http://localhost:8000/api/audits/compare/3/3
+HTTP/1.1 400 Bad Request
+{"detail":"请选择两条不同的审计记录进行对比：3 与 3 相同。"}
+```
+
+网页端在首页第 2 节「历史审计 · 两次对比」选择两条记录后点击对比即可：
+结果按新增 / 消失 / 变化分组，变化项会用 `硬冲突 → 告警` 这类徽标展示严重程度翻转，
+并同时渲染双方的最短依赖路径（红色=基准，绿色=目标），折叠区可查看全部节点配对明细。
 
 ## 审计结果结构（节选）
 
@@ -159,8 +202,9 @@ curl -OJ "http://localhost:8000/api/audits/1?package=pdf-export&download=true"
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由（JSON API + 网页）
+│   ├── main.py        # FastAPI 路由（JSON API + 网页，含两次审计对比接口）
 │   ├── analyzer.py    # manifest 解析、节点规范化、传递约束、最短路径
+│   ├── compare.py     # 两次审计对比：节点/冲突配对与变化检测（纯只读）
 │   ├── licenses.py    # 许可证别名规范化与兼容矩阵
 │   └── database.py    # SQLite 初始化与审计记录持久化
 ├── static/
